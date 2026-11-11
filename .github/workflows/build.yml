@@ -42,22 +42,6 @@ jobs:
           ldid -h 2>&1 | head -2 || true
           echo "ldid 就绪"
 
-      - name: 校验本地素材
-        run: |
-          set -e
-          DYLIB=assets/TrollStoreJITEnabler.dylib
-          ENT=assets/ts.entitlements
-          [ -f "$DYLIB" ] || { echo "::error::缺 dylib"; exit 1; }
-          [ -f "$ENT" ]   || { echo "::error::缺 entitlements"; exit 1; }
-          S=$(stat -c%s "$DYLIB"); H=$(sha256sum "$DYLIB" | cut -d' ' -f1)
-          E=$(stat -c%s "$ENT")
-          echo "dylib $S / $H"
-          echo "ent   $E"
-          [ "$S" = "$DYLIB_SIZE" ] || { echo "::error::dylib 大小异常"; exit 1; }
-          [ "$H" = "$DYLIB_SHA" ]  || { echo "::error::dylib 哈希不符"; exit 1; }
-          [ "$E" = "$ENT_SIZE" ]   || { echo "::error::entitlements 大小异常"; exit 1; }
-          echo "素材校验通过"
-
       - name: 查询上游版本
         id: up
         env:
@@ -98,6 +82,41 @@ jobs:
           else
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
+
+      - name: 校验或提取素材
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          set -e
+          DYLIB=assets/TrollStoreJITEnabler.dylib
+          ENT=assets/ts.entitlements
+          mkdir -p assets
+
+          # 仓库里没有 dylib 时，从上游 v1.9.2 的 TrollStoreJIT 包里提取
+          if [ ! -f "$DYLIB" ] || [ "$(stat -c%s "$DYLIB")" != "$DYLIB_SIZE" ]; then
+            echo "本地无 dylib，从 v1.9.2 提取"
+            SRC=https://github.com/$UPSTREAM/releases/download/v1.9.2/ManicEMU.v1.9.2.TrollStoreJIT.ipa
+            curl -sSL --retry 5 --retry-delay 3 --retry-all-errors -o /tmp/ref.ipa "$SRC"
+            R=$(stat -c%s /tmp/ref.ipa)
+            echo "参考包 $R 字节"
+            [ "$R" -gt 104857600 ] || { echo "::error::参考包异常"; exit 1; }
+            mkdir -p /tmp/ref
+            unzip -q -o /tmp/ref.ipa -d /tmp/ref 2>/dev/null || true
+            FOUND=$(find /tmp/ref -name TrollStoreJITEnabler.dylib | head -1)
+            [ -n "$FOUND" ] || { echo "::error::参考包里找不到 dylib"; exit 1; }
+            cat "$FOUND" > "$DYLIB"
+            MAINREF=$(python3 findmain.py "$(find /tmp/ref/Payload -maxdepth 1 -name '*.app' | head -1)")
+            ldid -e "$MAINREF" > "$ENT"
+            rm -rf /tmp/ref /tmp/ref.ipa
+          fi
+
+          S=$(stat -c%s "$DYLIB"); H=$(sha256sum "$DYLIB" | cut -d' ' -f1)
+          E=$(stat -c%s "$ENT")
+          echo "dylib $S / $H"
+          echo "ent   $E"
+          [ "$S" = "$DYLIB_SIZE" ] || { echo "::error::dylib 大小异常"; exit 1; }
+          [ "$H" = "$DYLIB_SHA" ]  || { echo "::error::dylib 哈希不符"; exit 1; }
+          [ "$E" = "$ENT_SIZE" ]   || { echo "::error::entitlements 大小异常"; exit 1; }
+          echo "素材校验通过"
 
       - name: 定位源包
         id: src
