@@ -16,26 +16,33 @@ permissions:
 env:
   TARGET_NAME: NarutoSenki
   CONFIG: ${{ github.event.inputs.configuration || 'Release' }}
-  UPSTREAM: https://github.com/LeaderOnePro/NarutoSenki-cocos2dx.git
 
 jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 180
     steps:
-      - name: Clone upstream source
-        run: |
-          git clone --depth 1 "$UPSTREAM" src
-          du -sh src
-          ls src/projects/NarutoSenki/
+      - name: Checkout this repo (CI scripts)
+        uses: actions/checkout@v4
+        with:
+          path: ci-repo
+
+      - name: Checkout upstream game source
+        uses: actions/checkout@v4
+        with:
+          repository: LeaderOnePro/NarutoSenki-cocos2dx
+          path: src
+          fetch-depth: 1
 
       - name: Inject CI scripts
         run: |
+          ls -la ci-repo/ci/
           mkdir -p src/ci
-          cp ci/gen_ios_proj.py src/ci/
-          cp ci/patch_ios.py src/ci/
-          cp ci/selftest.py src/ci/
+          cp ci-repo/ci/gen_ios_proj.py src/ci/
+          cp ci-repo/ci/patch_ios.py src/ci/
+          cp ci-repo/ci/selftest.py src/ci/
           ls -la src/ci/
+          ls src/projects/NarutoSenki/
 
       - name: Show toolchain
         run: |
@@ -71,7 +78,7 @@ jobs:
             ENABLE_BITCODE=NO \
             CODE_SIGNING_ALLOWED=NO \
             SYMROOT="$PWD/out/build" \
-            2>&1 | tee ../cocos2dx.log | tail -150
+            2>&1 | tee "$GITHUB_WORKSPACE/cocos2dx.log" | tail -150
           echo "=== 产出的 .a ==="
           find "$PWD/out/build" -name "*.a" -maxdepth 4 || true
 
