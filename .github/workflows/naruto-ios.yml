@@ -36,20 +36,16 @@ jobs:
 
       - name: Inject CI scripts
         run: |
-          ls -la ci-repo/ci/
           mkdir -p src/ci
           cp ci-repo/ci/gen_ios_proj.py src/ci/
           cp ci-repo/ci/patch_ios.py src/ci/
           cp ci-repo/ci/selftest.py src/ci/
           ls -la src/ci/
-          ls src/projects/NarutoSenki/
 
       - name: Show toolchain
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
-          sw_vers
-          uname -m
 
       - name: Generate proj.ios
         working-directory: src
@@ -78,17 +74,16 @@ jobs:
             ENABLE_BITCODE=NO \
             CODE_SIGNING_ALLOWED=NO \
             SYMROOT="$PWD/out/build" \
-            2>&1 | tee "$GITHUB_WORKSPACE/cocos2dx.log" | tail -150
-          echo "=== 产出的 .a ==="
-          find "$PWD/out/build" -name "*.a" -maxdepth 4 || true
+            2>&1 | tail -100
 
+      # ---------- 编译游戏：不 tee，直接输出，让错误完整出现在日志里 ----------
       - name: Build game app
         id: game
         working-directory: src
         run: |
-          set -o pipefail
           PROJ_DIR="$PWD/out/projects/NarutoSenki/proj.ios"
           cd "$PROJ_DIR"
+          set +e
           xcodebuild \
             -project "$TARGET_NAME.xcodeproj" \
             -target "$TARGET_NAME" \
@@ -101,9 +96,21 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CONFIGURATION_BUILD_DIR="$PROJ_DIR/build/$CONFIG-iphoneos" \
             SYMROOT="$PROJ_DIR/build" \
-            2>&1 | tee "$GITHUB_WORKSPACE/build-app.log" | tail -200
-          echo "=== 产出的 .app ==="
+            > "$GITHUB_WORKSPACE/build-app.log" 2>&1
+          RC=$?
+          echo "xcodebuild 退出码: $RC"
+
+          echo "======== 错误摘要（前 60 条） ========"
+          grep -E "error:|fatal error|Undefined symbols|BUILD FAILED|ld: " "$GITHUB_WORKSPACE/build-app.log" \
+            | sort -u | head -60 || echo "(无匹配错误行)"
+
+          echo "======== 日志末尾 80 行 ========"
+          tail -80 "$GITHUB_WORKSPACE/build-app.log"
+
+          echo "======== 产出的 .app ========"
           find "$PROJ_DIR/build" -name "*.app" -type d || true
+
+          exit $RC
 
       - name: Package unsigned IPA
         run: |
@@ -122,38 +129,12 @@ jobs:
           path: NarutoSenki-unsigned.ipa
           retention-days: 30
 
-      - name: Collect logs
-        if: always()
-        run: |
-          mkdir -p logs
-          [ -f cocos2dx.log ] && cp cocos2dx.log logs/
-          [ -f build-app.log ] && cp build-app.log logs/
-          cp -f src/out/projects/NarutoSenki/proj.ios/NarutoSenki.xcodeproj/project.pbxproj logs/ 2>/dev/null || true
-          grep -hE "error:|Error:|BUILD FAILED|Undefined symbols|fatal error" logs/*.log 2>/dev/null \
-            | sort -u | head -400 > logs/errors.txt || true
-          echo "错误行数: $(wc -l < logs/errors.txt 2>/dev/null || echo 0)"
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "### NarutoSenki iOS" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| 步骤 | 结果 |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| cocos2dx 静态库 | ${{ steps.cocos2dx.outcome }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 游戏 App | ${{ steps.game.outcome }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -s logs/errors.txt ]; then
-            echo "### 前 40 条错误" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            head -40 logs/errors.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          fi
-
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: naruto-build-logs
-          path: logs/
+          path: |
+            build-app.log
+            src/out/projects/NarutoSenki/proj.ios/NarutoSenki.xcodeproj/project.pbxproj
           retention-days: 7
