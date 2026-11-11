@@ -1,0 +1,280 @@
+name: Build TrollStore IPA
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '指定版本号（如 2.0.3），留空则取上游最新'
+        required: false
+        default: ''
+      force:
+        description: '强制重跑（已存在同版本 release 时覆盖）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Manic-EMU/ManicEMU
+  DYLIB_SHA: f1b267bae9b444acd23958655da50eef0d649e6fb2bc9fd7d15487de3e45ae30
+  DYLIB_SIZE: '158896'
+  ENT_SIZE: '998'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 ldid
+        run: |
+          curl -sSL -o /usr/local/bin/ldid \
+            https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
+          chmod +x /usr/local/bin/ldid
+          ldid -h 2>&1 | head -2 || true
+          echo "ldid 就绪"
+
+      - name: 校验本地素材
+        run: |
+          set -e
+          DYLIB=assets/TrollStoreJITEnabler.dylib
+          ENT=assets/ts.entitlements
+          [ -f "$DYLIB" ] || { echo "::error::缺 dylib"; exit 1; }
+          [ -f "$ENT" ]   || { echo "::error::缺 entitlements"; exit 1; }
+          S=$(stat -c%s "$DYLIB"); H=$(sha256sum "$DYLIB" | cut -d' ' -f1)
+          E=$(stat -c%s "$ENT")
+          echo "dylib $S / $H"
+          echo "ent   $E"
+          [ "$S" = "$DYLIB_SIZE" ] || { echo "::error::dylib 大小异常"; exit 1; }
+          [ "$H" = "$DYLIB_SHA" ]  || { echo "::error::dylib 哈希不符"; exit 1; }
+          [ "$E" = "$ENT_SIZE" ]   || { echo "::error::entitlements 大小异常"; exit 1; }
+          echo "素材校验通过"
+
+      - name: 查询上游版本
+        id: up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WANT: ${{ inputs.version }}
+        run: |
+          set -e
+          if [ -n "$WANT" ]; then
+            VER="$WANT"
+          else
+            VER=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/$UPSTREAM/releases?per_page=10" \
+              | jq -r '[.[] | select(.prerelease==false and .draft==false)
+                       | .tag_name | sub("^v";"")] | .[0] // empty')
+          fi
+          VER="${VER#v}"
+          [ -n "$VER" ] || { echo "::error::取不到版本号"; exit 1; }
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "上游版本: $VER"
+
+      - name: 判断是否已有产物
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER: ${{ steps.up.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -e
+          if [ "$FORCE" = "true" ]; then
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "强制模式，跳过检查"
+            exit 0
+          fi
+          if curl -sf -H "Authorization: token $GH_TOKEN" \
+             "https://api.github.com/repos/${{ github.repository }}/releases/tags/v$VER" > /dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "v$VER 已发布过，跳过"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 定位源包
+        id: src
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER: ${{ steps.up.outputs.version }}
+        run: |
+          set -e
+          BASE="https://github.com/$UPSTREAM/releases/download/v$VER"
+          TS="ManicEMU.v$VER.TrollStoreJIT.ipa"
+          SL="ManicEMU.v$VER.SideloadJIT.ipa"
+          code() { curl -sSIL -m 40 -o /dev/null -w '%{http_code}' "$1" | tail -1; }
+
+          if [ "$(code "$BASE/$TS")" = "200" ]; then
+            echo "mode=direct" >> $GITHUB_OUTPUT
+            echo "url=$BASE/$TS" >> $GITHUB_OUTPUT
+            echo "官方有 TrollStoreJIT 资产，直接转发"
+          elif [ "$(code "$BASE/$SL")" = "200" ]; then
+            echo "mode=rebuild" >> $GITHUB_OUTPUT
+            echo "url=$BASE/$SL" >> $GITHUB_OUTPUT
+            echo "只有 SideloadJIT，走转制"
+          else
+            echo "::error::v$VER 既无 TrollStoreJIT 也无 SideloadJIT"
+            exit 1
+          fi
+
+      - name: 下载源包
+        if: steps.check.outputs.exists == 'false'
+        env:
+          URL: ${{ steps.src.outputs.url }}
+        run: |
+          set -e
+          mkdir -p work
+          curl -sSL --retry 5 --retry-delay 3 --retry-all-errors \
+            -o work/src.ipa "$URL"
+          ls -l work/src.ipa
+          SZ=$(stat -c%s work/src.ipa)
+          echo "源包 $SZ 字节"
+          [ "$SZ" -gt 104857600 ] || { echo "::error::源包过小，疑似失败页"; exit 1; }
+          unzip -t work/src.ipa > /dev/null || { echo "::error::源包 CRC 损坏"; exit 1; }
+
+      - name: 解包并定位 app
+        id: unpack
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          set -e
+          unzip -q -o work/src.ipa -d work/build
+          APP=$(find work/build/Payload -maxdepth 1 -name '*.app' | head -1)
+          [ -n "$APP" ] || { echo "::error::解包后无 .app"; exit 1; }
+          echo "app=$APP" >> $GITHUB_OUTPUT
+          echo "app: $APP"
+
+      - name: 转制
+        if: steps.check.outputs.exists == 'false' && steps.src.outputs.mode == 'rebuild'
+        env:
+          APP: ${{ steps.unpack.outputs.app }}
+        run: |
+          set -e
+          cat assets/TrollStoreJITEnabler.dylib > "$APP/TrollStoreJITEnabler.dylib"
+          [ "$(stat -c%s "$APP/TrollStoreJITEnabler.dylib")" = "$DYLIB_SIZE" ] || {
+            echo "::error::dylib 落地大小异常"; exit 1; }
+
+          MAIN=$(python3 findmain.py "$APP")
+          [ -n "$MAIN" ] || { echo "::error::找不到主程序"; exit 1; }
+          echo "主程序: $(basename "$MAIN")"
+
+          python3 inject.py "$MAIN" TrollStoreJITEnabler.dylib
+
+          find "$APP" -name embedded.mobileprovision -delete 2>/dev/null || true
+          if find "$APP" -name embedded.mobileprovision | grep -q .; then
+            echo "::error::描述文件未删净"; exit 1
+          fi
+
+          python3 sign.py "$APP"
+
+      - name: 打包
+        id: pack
+        if: steps.check.outputs.exists == 'false'
+        env:
+          VER: ${{ steps.up.outputs.version }}
+          MODE: ${{ steps.src.outputs.mode }}
+        run: |
+          set -e
+          mkdir -p dist
+          F="dist/ManicEMU.v$VER.TrollStore.ipa"
+          if [ "$MODE" = "rebuild" ]; then
+            python3 pack.py dist work/build "ManicEMU.v$VER.TrollStore.ipa"
+          else
+            cp work/src.ipa "$F"
+          fi
+          ls -l "$F"
+          echo "sha256=$(sha256sum "$F" | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "size=$(stat -c%s "$F")" >> $GITHUB_OUTPUT
+
+      - name: 产物自检
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          set -e
+          F="dist/ManicEMU.v${{ steps.up.outputs.version }}.TrollStore.ipa"
+          if [ "${{ steps.src.outputs.mode }}" = "rebuild" ]; then
+            python3 verify.py "$F" 1
+          else
+            python3 verify.py "$F" 0
+          fi
+
+      - name: 发布 Release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VER: ${{ steps.up.outputs.version }}
+          SHA: ${{ steps.pack.outputs.sha256 }}
+          SIZE: ${{ steps.pack.outputs.size }}
+          MODE: ${{ steps.src.outputs.mode }}
+        run: |
+          set -e
+          F="dist/ManicEMU.v$VER.TrollStore.ipa"
+          if [ "$MODE" = "direct" ]; then
+            NOTE="上游已提供官方 TrollStoreJIT 资产，本版本为原样转发。"
+          else
+            NOTE="由上游 SideloadJIT 包转制：注入 TrollStoreJITEnabler.dylib、替换 entitlements、重签。"
+          fi
+          {
+            echo "ManicEMU v$VER · TrollStore 可装版本"
+            echo
+            echo "$NOTE"
+            echo
+            echo "- 文件：\`ManicEMU.v$VER.TrollStore.ipa\`"
+            echo "- 大小：$SIZE 字节"
+            echo "- sha256：\`$SHA\`"
+            echo "- 来源：https://github.com/$UPSTREAM/releases/tag/v$VER"
+            echo
+            echo "## 安装"
+            echo
+            echo "先卸载设备上的旧版（同 Bundle ID，不卸会沿用旧数据目录），"
+            echo "再长按 ipa → 共享 → TrollStore → Install。"
+            echo
+            echo "点开秒退时查：设置 → 隐私与安全性 → 分析与改进 → 分析数据 → ManicEmu-*.ips"
+          } > notes.md
+
+          RID=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/v$VER" \
+            | jq -r '.id // empty')
+          if [ -n "$RID" ]; then
+            echo "删除旧 release $RID"
+            curl -sS -X DELETE -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$RID"
+          fi
+
+          BODY=$(jq -Rs . < notes.md)
+          REL=$(curl -sS -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d "{\"tag_name\":\"v$VER\",\"name\":\"v$VER TrollStore\",\"body\":$BODY,\"draft\":false,\"prerelease\":false}")
+          UID_=$(echo "$REL" | jq -r '.upload_url // empty' | sed 's/{.*//')
+          [ -n "$UID_" ] || { echo "::error::创建 release 失败"; echo "$REL"; exit 1; }
+
+          curl -sS -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$F" \
+            "${UID_}?name=ManicEMU.v$VER.TrollStore.ipa" \
+            | jq -r '{name:.name, size:.size, state:.state}'
+          echo "已发布：https://github.com/${{ github.repository }}/releases/tag/v$VER"
+
+      - name: 汇总
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          echo "### ManicEMU v${{ steps.up.outputs.version }} · TrollStore" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 模式 | ${{ steps.src.outputs.mode }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 大小 | ${{ steps.pack.outputs.size }} 字节 |" >> $GITHUB_STEP_SUMMARY
+          echo "| sha256 | \`${{ steps.pack.outputs.sha256 }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: 清理
+        if: always()
+        run: rm -rf work dist notes.md || true
