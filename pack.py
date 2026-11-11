@@ -4,6 +4,7 @@
 import os, sys, zipfile
 
 MAGICS = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca'}
+FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 
 def is_macho(p):
     try:
@@ -33,6 +34,7 @@ def main():
             for d in sorted(dirs):
                 p = os.path.join(root, d)
                 zi = zipfile.ZipInfo(os.path.relpath(p, work).replace(os.sep, '/') + '/')
+                zi.date_time = FIXED_TIME
                 zi.external_attr = (0o40755 << 16) | 0x10
                 zi.compress_type = zipfile.ZIP_STORED
                 z.writestr(zi, b'')
@@ -42,6 +44,7 @@ def main():
                 if mode == 0o100755:
                     cnt += 1
                 zi = zipfile.ZipInfo(os.path.relpath(p, work).replace(os.sep, '/'))
+                zi.date_time = FIXED_TIME
                 zi.external_attr = mode << 16
                 zi.compress_type = zipfile.ZIP_DEFLATED
                 z.writestr(zi, open(p, 'rb').read())
