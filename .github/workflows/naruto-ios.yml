@@ -44,8 +44,8 @@ jobs:
         run: |
           mkdir -p src/ci
           cp ci-repo/ci/*.py src/ci/
-          cp ci-repo/ci/mk_ipa.sh src/ci/
-          chmod +x src/ci/mk_ipa.sh
+          cp ci-repo/ci/mk_ipa.sh ci-repo/ci/fix_png.sh src/ci/
+          chmod +x src/ci/mk_ipa.sh src/ci/fix_png.sh
 
       - name: Generate & patch project
         working-directory: src
@@ -88,8 +88,7 @@ jobs:
           PROJ_DIR="$PWD/out/projects/NarutoSenki/proj.ios"
           cd "$PROJ_DIR"
           # -Wl,-adhoc_codesign: 让 ld 生成 LC_CODE_SIGNATURE 槽位。
-          # 不加的话可执行文件没有代码签名段，TrollStore 重签后无法注册
-          # （trollstorehelper 报 Unable to register / returning 181）。
+          # 不加的话可执行文件没有代码签名段，TrollStore 重签后无法注册。
           xcodebuild \
             -project "$TARGET_NAME.xcodeproj" \
             -target "$TARGET_NAME" \
@@ -131,11 +130,13 @@ jobs:
           name: NarutoSenki ${{ env.CONFIG }} build ${{ github.run_number }}
           files: src/NarutoSenki.ipa
           body: |
-            TrollStore 可直装 IPA（ad-hoc 签名，含 LC_CODE_SIGNATURE）。
+            TrollStore 可直装 IPA。
 
             - 配置：${{ env.CONFIG }}
             - 架构：arm64
             - 最低系统：iOS 12.0
+            - 签名：ad-hoc（含 LC_CODE_SIGNATURE）
+            - 图标：已转为标准 PNG
             - SHA256：`${{ steps.pack.outputs.sha256 }}`
 
             安装：长按 ipa → 共享 → TrollStore → Install。
@@ -156,7 +157,7 @@ jobs:
             echo ""
             echo "## 打包"
             echo '```'
-            [ -f pack.log ] && tail -60 pack.log || echo "(无)"
+            [ -f pack.log ] && tail -80 pack.log || echo "(无)"
             echo '```'
             echo ""
             echo "## 游戏 target"
