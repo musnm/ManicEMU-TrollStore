@@ -16,12 +16,15 @@ cp -R "$APP" "Payload/$TARGET_NAME.app"
 APP_DIR="Payload/$TARGET_NAME.app"
 BIN="$APP_DIR/$TARGET_NAME"
 
+echo "----- CgBI PNG 转换 -----"
+sh ci/fix_png.sh "$APP_DIR"
+
+echo "----- Info.plist 修复 -----"
+python3 ci/fix_infoplist.py "$APP_DIR"
+
 echo "----- 可执行文件 -----"
 file "$BIN"
 lipo -info "$BIN" || true
-
-echo "----- 签名前校验 -----"
-python3 ci/check_bundle.py "$APP_DIR" 2>/dev/null || true
 
 # 清掉可能来自构建机的扩展属性
 xattr -cr "$APP_DIR" 2>/dev/null || true
@@ -54,7 +57,7 @@ echo "----- 签名验证 -----"
 codesign -dv "$BIN" 2>&1 | head -8 || true
 codesign --verify --verbose=2 "$APP_DIR" 2>&1 | tail -3 || true
 
-echo "----- 打包后校验 -----"
+echo "----- 打包前校验 -----"
 python3 ci/check_bundle.py "$APP_DIR"
 
 zip -qry "$TARGET_NAME.ipa" Payload
