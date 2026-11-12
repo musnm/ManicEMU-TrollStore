@@ -1,0 +1,58 @@
+name: pbx 最小验证
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  t:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ci-repo }
+      - uses: actions/checkout@v4
+        with:
+          repository: LeaderOnePro/NarutoSenki-cocos2dx
+          path: src
+          fetch-depth: 1
+
+      - name: Prepare
+        working-directory: src
+        run: |
+          mkdir -p ci
+          cp /var/minis/workspace/ci/*.py ci/ 2>/dev/null || cp ../ci-repo/ci/*.py ci/
+          python3 ci/gen_ios_proj.py . out
+          python3 ci/repair_pbxproj.py .
+          python3 ci/fix_proj.py .
+          python3 ci/patch_ios.py .
+
+      - name: Test xcodebuild -list
+        working-directory: src/out/projects/NarutoSenki/proj.ios
+        run: |
+          echo "### A: -list"
+          set +e
+          xcodebuild -project NarutoSenki.xcodeproj -list > /tmp/a.txt 2>&1
+          echo "RC=$?"
+          cat /tmp/a.txt
+          echo ""
+
+          echo "### B: 子工程是否可解析"
+          ls -la ../../../cocos2dx/proj.ios/cocos2dx.xcodeproj/ 2>&1
+          xcodebuild -project ../../../cocos2dx/proj.ios/cocos2dx.xcodeproj -list > /tmp/b.txt 2>&1
+          echo "RC=$?"
+          cat /tmp/b.txt
+
+      - name: Report
+        if: always()
+        run: |
+          cd src/out/projects/NarutoSenki/proj.ios
+          { echo "# 验证报告"; echo ""; echo "## A -list"; echo '```'; cat /tmp/a.txt 2>/dev/null | head -80; echo '```';
+            echo ""; echo "## B 子工程"; echo '```'; cat /tmp/b.txt 2>/dev/null | head -80; echo '```'; } \
+            > "$GITHUB_WORKSPACE/ci-repo/REPORT.md"
+          cd "$GITHUB_WORKSPACE/ci-repo"
+          git config user.name bot; git config user.email b@x
+          git add REPORT.md
+          git commit -m "ci: report [skip ci]" || true
+          git push || true
