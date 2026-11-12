@@ -4,16 +4,15 @@
 # 重要：这里绝对不能在 CI 里做 codesign。
 #
 # 实测（TrollStore 的 trollstorehelper 日志）：
-#   macOS runner 上 `codesign -s -` 给这个老式 Mach-O 写出来的签名结构是
-#   畸形的 —— SuperBlob 只有 1 个条目、且把 CodeDirectory 塞进了 slot 0
-#   （magic 应为 0xfade0c01，实际是 0xfade0c02）。LaunchServices 解析时
-#   从错误偏移读到 SignatureVersion = 132352，注册阶段直接失败：
+#   macOS runner 上 `codesign -s -` 给这个老式 cocos2d-x Mach-O 写出来的
+#   签名结构是畸形的 —— SuperBlob 只有 1 个条目、且把 CodeDirectory 塞进
+#   了 slot 0（magic 应为 0xfade0c01，实际是 0xfade0c02）。LaunchServices
+#   解析时从错误偏移读到 SignatureVersion = 132352 (0x20500)，注册失败：
 #       Error: Unable to register .../NarutoSenki.app
 #       trollstorehelper returning 181
 #
-# 正确做法：只让链接器预留一个空的 LC_CODE_SIGNATURE 槽位
-# （-Wl,-adhoc_codesign 已在链接阶段完成），签名全部交给 TrollStore 的
-# ldid 在设备上完成。
+# 正确做法：把 LC_CODE_SIGNATURE 清成空槽位（dataoff 指向文件尾、
+# datasize=0），签名完全交给 TrollStore 的 ldid 在设备上完成。
 set -e
 
 TARGET_NAME="${TARGET_NAME:-NarutoSenki}"
@@ -40,13 +39,11 @@ echo "----- 可执行文件 -----"
 file "$BIN"
 lipo -info "$BIN" || true
 
-# 清掉构建机带来的扩展属性（否则会被打进 zip 的元数据里）
+# 清掉可能来自构建机的扩展属性
 xattr -cr "$APP_DIR" 2>/dev/null || true
 
-echo "----- 清除任何残留签名（关键） -----"
-# ld 的 -adhoc_codesign 已给出 LC_CODE_SIGNATURE 槽位。这里若有 codesign
-# 产物会被 TrollStore 误读，先去掉再重新留空槽。
-codesign --remove-signature "$BIN" 2>/dev/null && echo "  已移除旧签名" || echo "  无旧签名"
+echo "----- 清空代码签名（关键：不做本机签名） -----"
+python3 ci/strip_sig.py "$BIN"
 
 echo "----- 打包前校验 -----"
 python3 ci/check_bundle.py "$APP_DIR"
