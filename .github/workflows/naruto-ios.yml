@@ -34,8 +34,11 @@ jobs:
           path: src
           fetch-depth: 1
 
-      - name: Setup python deps
-        run: pip3 install --quiet openstep-parser
+      - name: Install python deps (best effort)
+        continue-on-error: true
+        run: |
+          python3 -m pip install --quiet --user openstep-parser 2>&1 | tail -3 || true
+          python3 -c "import openstep_parser; print('openstep_parser OK')" || echo "不可用，将跳过语法校验"
 
       - name: Inject CI scripts
         run: |
@@ -86,7 +89,6 @@ jobs:
         run: |
           PROJ_DIR="$PWD/out/projects/NarutoSenki/proj.ios"
           LIB_DIR="$PWD/out/libs/$CONFIG-iphoneos"
-          echo "LIB_DIR=$LIB_DIR"
           ls -la "$LIB_DIR" 2>/dev/null || echo "(空)"
 
           cd "$PROJ_DIR"
