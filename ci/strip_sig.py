@@ -1,90 +1,109 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""把 Mach-O 的 LC_CODE_SIGNATURE 清成"空占位"。
+"""把 Mach-O 的 LC_CODE_SIGNATURE 置成"空槽位"（dataoff=0, datasize=0）。
 
-背景：
-  用 CODE_SIGNING_ALLOWED=NO + -Wl,-adhoc_codesign 编出来的二进制，
-  签名段是一个 ad-hoc 签名。若在 CI 上再跑 codesign --sign -，
-  在没有落盘签名身份的环境中会写出**残缺的 SuperBlob**：只有
-  一个 slot，且 magic 是 0xfade0c02（entitlements）而不是
-  0xfade0c01（CodeDirectory）。TrollStore 的 ldid 之后虽然能重签，
-  但 LaunchServices 读到的 SignatureVersion 是垃圾值
-  （132352 = 0x20500），注册阶段直接失败 → trollstorehelper returning 181。
+背景（实测 TrollStore 日志）：
+  macOS runner 的 `codesign -s -` 给这个老式 cocos2d-x 二进制写出的签名
+  结构是畸形的：SuperBlob 只有 1 个条目，且把 CodeDirectory 塞进 slot 0，
+  magic 也不对。LaunchServices 解析时从错误偏移读到
+  SignatureVersion = 132352 (0x20500)，注册阶段直接失败：
+      Error: Unable to register .../NarutoSenki.app
+      trollstorehelper returning 181
 
-正确做法：
-  把 CodeDirectory 掏空——LC_CODE_SIGNATURE 的 dataoff 指向文件尾、
-  datasize 置 0，文件截断到签名之前。这样二进制处于"未签名"状态，
-  TrollStore 的 ldid 会自己分配空间写入完整签名。
+  而完全不带 LC_CODE_SIGNATURE 的二进制，TrollStore 的 ldid 也无从下手。
+
+所以这里保留 LC_CODE_SIGNATURE 命令本身（ld 已分配好），只把
+dataoff/datasize 归零，文件截到签名数据之前。这样二进制处于干净的
+"未签名但结构完整" 状态，设备和 ldid 都能正确处理。
 """
 import os
 import struct
 import sys
 
+LC_SEGMENT_64 = 0x19
 LC_CODE_SIGNATURE = 0x1D
+MH_MAGIC_64 = 0xFEEDFACF
 
 
-def strip_signature(path):
-    with open(path, "rb") as f:
-        data = bytearray(f.read())
-
-    magic = struct.unpack("<I", data[:4])[0]
-    if magic != 0xFEEDFACF:
-        print("  [!] 不是 64 位 Mach-O (magic=%#x)，跳过" % magic)
-        return False
-
+def inspect(path):
+    data = open(path, "rb").read()
+    if struct.unpack("<I", data[:4])[0] != MH_MAGIC_64:
+        return None
     ncmds = struct.unpack("<I", data[16:20])[0]
     off = 32
-    sig_cmd_off = None
-    dataoff = datasize = 0
-
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack("<II", data[off:off + 8])
         if cmd == LC_CODE_SIGNATURE:
-            sig_cmd_off = off
             dataoff, datasize = struct.unpack("<II", data[off + 8:off + 16])
-            break
+            return off, dataoff, datasize, len(data)
         off += cmdsize
-
-    if sig_cmd_off is None:
-        print("  - 没有 LC_CODE_SIGNATURE，无需处理")
-        return False
-
-    print("  原签名: off=%d size=%d filesize=%d" % (dataoff, datasize, len(data)))
-
-    if dataoff == 0 and datasize == 0:
-        print("  - 已经是空占位")
-        return False
-
-    # 截断掉签名数据，并把 LC_CODE_SIGNATURE 置空
-    new_len = min(dataoff, len(data)) if dataoff else len(data)
-    struct.pack_into("<II", data, sig_cmd_off + 8, new_len, 0)
-    data = data[:new_len]
-
-    # __LINKEDIT 的 filesize/vmsize 需要同步缩小，否则 dyld 会越界
-    fix_linkedit(data)
-
-    with open(path, "wb") as f:
-        f.write(data)
-
-    print("  -> 已清空签名，新大小 %d" % len(data))
-    return True
+    return None
 
 
-def fix_linkedit(data):
-    """把 __LINKEDIT 段的 filesize 收回到实际内容末尾。"""
+def classify(path):
+    """判断二进制当前签名状态。"""
+    info = inspect(path)
+    if info is None:
+        return "no-lc-sig-cmd"
+    _, dataoff, datasize, filesize = info
+    if datasize == 0:
+        return "empty-slot"
+    data = open(path, "rb").read()
+    if dataoff + datasize > filesize:
+        return "broken-outofrange"
+    b = data[dataoff:dataoff + datasize]
+    if struct.unpack(">I", b[:4])[0] != 0xFADE0CC0:
+        return "broken-badmagic"
+    count = struct.unpack(">I", b[8:12])[0]
+    kinds = []
+    for i in range(count):
+        _, bo = struct.unpack(">II", b[12 + i * 8:20 + i * 8])
+        kinds.append(hex(struct.unpack(">I", b[bo:bo + 4])[0]))
+    if count == 1 and kinds and kinds[0] != "0xfade0c01":
+        return "broken-slot0-%s" % kinds[0]
+    return "signed-ok"
+
+
+def clear_signature(path):
+    """把 LC_CODE_SIGNATURE 置为零，并截断签名数据。"""
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+
+    info = inspect(path)
+    if info is None:
+        print("  - 没有 LC_CODE_SIGNATURE 命令，保持原样")
+        return True
+
+    cmd_off, dataoff, datasize, filesize = info
+    if datasize == 0 and dataoff == 0:
+        print("  - 已经是空槽位")
+        return True
+
+    # 截断点：签名数据起点；若越界则用文件尾
+    cut = dataoff if 0 < dataoff <= len(data) else len(data)
+
+    # LC_CODE_SIGNATURE 置空。dataoff 用截断后的长度，datasize 为 0
+    struct.pack_into("<II", data, cmd_off + 8, cut, 0)
+
+    # __LINKEDIT 需同步收窄，否则 dyld 会按旧 filesize 越界映射
     ncmds = struct.unpack("<I", data[16:20])[0]
     off = 32
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack("<II", data[off:off + 8])
-        if cmd == 0x19:  # LC_SEGMENT_64
+        if cmd == LC_SEGMENT_64:
             segname = bytes(data[off + 8:off + 24]).rstrip(b"\x00")
             if segname == b"__LINKEDIT":
-                vmaddr, vmsize = struct.unpack("<QQ", data[off + 24:off + 40])
-                fileoff, filesize = struct.unpack("<QQ", data[off + 40:off + 56])
-                if fileoff + filesize > len(data):
-                    struct.pack_into("<Q", data, off + 48, len(data) - fileoff)
-                return
+                fileoff, fsize = struct.unpack("<QQ", data[off + 40:off + 56])
+                if fileoff + fsize > cut:
+                    struct.pack_into("<Q", data, off + 48, max(0, cut - fileoff))
+                break
         off += cmdsize
+
+    newdata = data[:cut]
+    with open(path, "wb") as f:
+        f.write(newdata)
+    print("  -> 清空签名: %d -> %d bytes" % (filesize, len(newdata)))
+    return True
 
 
 def main():
@@ -92,9 +111,28 @@ def main():
     if not apps:
         print("用法: strip_sig.py <可执行文件...>")
         sys.exit(1)
+
+    bad = 0
     for p in apps:
         print("[*] %s" % p)
-        strip_signature(p)
+        state = classify(p)
+        print("  当前状态: %s" % state)
+        if state == "no-lc-sig-cmd":
+            # 链接时没加 -Wl,-adhoc_codesign，TrollStore 无法签名
+            print("  [FAIL] 缺少 LC_CODE_SIGNATURE 命令，无法在设备上签名")
+            bad += 1
+            continue
+        clear_signature(p)
+        after = classify(p)
+        print("  处理后: %s" % after)
+        if after != "empty-slot":
+            bad += 1
+
+    print("")
+    if bad:
+        print("有 %d 个文件状态异常" % bad)
+        sys.exit(1)
+    print("全部为空的 LC_CODE_SIGNATURE 槽位，交给 TrollStore 签名")
 
 
 if __name__ == "__main__":
