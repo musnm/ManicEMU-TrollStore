@@ -76,9 +76,7 @@ jobs:
               tail -80 "$GITHUB_WORKSPACE/cocos2dx.log"
               exit 1
             }
-          echo "----- 产物 -----"
           find "$PWD/out/libs" -name "*.a" -exec ls -lh {} \;
-          # 把静态库放到工程能找到的 libs/ 目录
           find "$PWD/out/libs" -name "*.a" -exec cp -f {} "$LIB_OUT"/ \;
           ls -lh "$LIB_OUT"
 
@@ -88,6 +86,9 @@ jobs:
           set -o pipefail
           PROJ_DIR="$PWD/out/projects/NarutoSenki/proj.ios"
           cd "$PROJ_DIR"
+          # -Wl,-adhoc_codesign: 让 ld 生成 LC_CODE_SIGNATURE 槽位。
+          # 不加的话可执行文件没有代码签名段，TrollStore 重签后无法注册
+          # （trollstorehelper 报 Unable to register / returning 181）。
           xcodebuild \
             -project "$TARGET_NAME.xcodeproj" \
             -target "$TARGET_NAME" \
@@ -98,6 +99,7 @@ jobs:
             ENABLE_BITCODE=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
+            OTHER_LDFLAGS='$(inherited) -Wl,-adhoc_codesign' \
             SYMROOT="$PROJ_DIR/build" \
             > "$GITHUB_WORKSPACE/build-app.log" 2>&1 || {
               echo "===== 游戏构建失败 ====="
@@ -109,7 +111,7 @@ jobs:
             }
           find "$PROJ_DIR/build" -name "*.app" -type d
 
-      - name: Package unsigned IPA
+      - name: Package & ad-hoc sign IPA
         id: pack
         run: |
           set -e
@@ -117,16 +119,48 @@ jobs:
           if [ -z "$APP" ]; then echo "找不到 .app"; exit 1; fi
           echo "APP=$APP"
           rm -rf Payload "$TARGET_NAME.ipa"
-          mkdir -p Payload
-          cp -R "$APP" "Payload/$TARGET_NAME.app"
+          mkdir -p "Payload/$TARGET_NAME.app"
+          cp -R "$APP"/. "Payload/$TARGET_NAME.app"/
+
+          BIN="Payload/$TARGET_NAME.app/$TARGET_NAME"
+
+          echo "----- 签名前 LC_CODE_SIGNATURE 检查 -----"
+          python3 - "$BIN" <<'PY'
+          import struct, sys
+          p = sys.argv[1]
+          d = open(p, 'rb').read()
+          ncmds = struct.unpack('<I', d[16:20])[0]
+          off, found = 32, False
+          for _ in range(ncmds):
+              cmd, sz = struct.unpack('<II', d[off:off+8])
+              if cmd == 0x1d:
+                  found = True
+              off += sz
+          print("LC_CODE_SIGNATURE:", found)
+          if not found:
+              print("!! 缺少代码签名段，TrollStore 将无法注册")
+              sys.exit(1)
+          PY
+
+          echo "----- ad-hoc 签名 -----"
+          codesign --force --sign - --timestamp=none \
+            --entitlements /dev/null "$BIN" 2>/dev/null || \
+            codesign --force --sign - --timestamp=none "$BIN"
+          codesign -dv "$BIN" 2>&1 | head -10 || true
+          codesign --verify --deep --verbose=2 "Payload/$TARGET_NAME.app" 2>&1 | tail -5 || true
+
+          # 清理可能干扰的扩展属性
+          xattr -cr "Payload/$TARGET_NAME.app" || true
+
           zip -qry "$TARGET_NAME.ipa" Payload
           ls -lh "$TARGET_NAME.ipa"
-          BIN="Payload/$TARGET_NAME.app/$TARGET_NAME"
           file "$BIN"
           lipo -info "$BIN" || true
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" \
             "Payload/$TARGET_NAME.app/Info.plist" || true
-          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" \
+            "Payload/$TARGET_NAME.app/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" \
             "Payload/$TARGET_NAME.app/Info.plist" || true
           echo "sha256=$(shasum -a 256 "$TARGET_NAME.ipa" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
@@ -138,10 +172,14 @@ jobs:
           name: NarutoSenki ${{ env.CONFIG }} build ${{ github.run_number }}
           files: NarutoSenki.ipa
           body: |
-            未签名 IPA，适用于 TrollStore / 自签工具。
+            TrollStore 可直装 IPA（已做 ad-hoc 签名，含 LC_CODE_SIGNATURE）。
+
             - 配置：${{ env.CONFIG }}
             - 架构：arm64
+            - 最低系统：iOS 12.0
             - SHA256：`${{ steps.pack.outputs.sha256 }}`
+
+            安装：长按 ipa → 共享 → TrollStore → Install。
 
       - name: Upload IPA
         if: success()
