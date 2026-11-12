@@ -37,15 +37,7 @@ jobs:
       - name: Inject CI scripts
         run: |
           mkdir -p src/ci
-          cp ci-repo/ci/gen_ios_proj.py src/ci/
-          cp ci-repo/ci/patch_ios.py src/ci/
-          cp ci-repo/ci/selftest.py src/ci/
-          ls -la src/ci/
-
-      - name: Show toolchain
-        run: |
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
+          cp ci-repo/ci/*.py src/ci/
 
       - name: Generate proj.ios
         working-directory: src
@@ -59,11 +51,26 @@ jobs:
         working-directory: src
         run: python3 ci/selftest.py
 
+      # ---------- 诊断：列出工程里的 target ----------
+      - name: Diagnose project
+        working-directory: src
+        run: |
+          PROJ="out/projects/NarutoSenki/proj.ios/NarutoSenki.xcodeproj"
+          echo "===== xcodebuild -list ====="
+          xcodebuild -project "$PROJ" -list 2>&1 | head -60 || true
+          echo
+          echo "===== 工程目录 ====="
+          ls -la out/projects/NarutoSenki/proj.ios/
+          echo
+          echo "===== 子工程引用 ====="
+          grep -nE "cocos2dx.xcodeproj|CocosDenshion" "$PROJ/project.pbxproj" | head -20
+
+      # ---------- 编译 cocos2dx 静态库 ----------
       - name: Build cocos2dx static lib
         id: cocos2dx
         working-directory: src
+        continue-on-error: true
         run: |
-          set -o pipefail
           xcodebuild \
             -project cocos2dx/proj.ios/cocos2dx.xcodeproj \
             -target cocos2dx \
@@ -73,10 +80,15 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             ENABLE_BITCODE=NO \
             CODE_SIGNING_ALLOWED=NO \
-            SYMROOT="$PWD/out/build" \
-            2>&1 | tail -100
+            SYMROOT="$PWD/out/libs" \
+            > "$GITHUB_WORKSPACE/cocos2dx.log" 2>&1
+          echo "退出码: $?"
+          echo "===== 产出的 .a ====="
+          find "$PWD/out/libs" -name "*.a" 2>/dev/null || true
+          echo "===== 日志末尾 30 行 ====="
+          tail -30 "$GITHUB_WORKSPACE/cocos2dx.log"
 
-      # ---------- 编译游戏：不 tee，直接输出，让错误完整出现在日志里 ----------
+      # ---------- 编译游戏 App ----------
       - name: Build game app
         id: game
         working-directory: src
@@ -94,47 +106,28 @@ jobs:
             ENABLE_BITCODE=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
-            CONFIGURATION_BUILD_DIR="$PROJ_DIR/build/$CONFIG-iphoneos" \
             SYMROOT="$PROJ_DIR/build" \
             > "$GITHUB_WORKSPACE/build-app.log" 2>&1
           RC=$?
-          echo "xcodebuild 退出码: $RC"
 
-          echo "======== 错误摘要（前 60 条） ========"
-          grep -E "error:|fatal error|Undefined symbols|BUILD FAILED|ld: " "$GITHUB_WORKSPACE/build-app.log" \
-            | sort -u | head -60 || echo "(无匹配错误行)"
-
-          echo "======== 日志末尾 80 行 ========"
-          tail -80 "$GITHUB_WORKSPACE/build-app.log"
-
-          echo "======== 产出的 .app ========"
-          find "$PROJ_DIR/build" -name "*.app" -type d || true
-
+          echo "################ xcodebuild 退出码: $RC ################"
+          echo
+          echo "################ 完整日志（最后 250 行） ################"
+          tail -250 "$GITHUB_WORKSPACE/build-app.log"
+          echo
+          echo "################ 错误行统计 ################"
+          grep -cE "error:" "$GITHUB_WORKSPACE/build-app.log" 2>/dev/null || echo 0
+          echo "################ 错误行（前 80 条） ################"
+          grep -E "error:|fatal error|Undefined symbols|ld: |BUILD FAILED" "$GITHUB_WORKSPACE/build-app.log" \
+            | sort -u | head -80 || true
           exit $RC
-
-      - name: Package unsigned IPA
-        run: |
-          APP=$(find src/out/projects/NarutoSenki/proj.ios/build -name "*.app" -type d -maxdepth 4 | head -1)
-          if [ -z "$APP" ]; then echo "找不到 .app"; exit 1; fi
-          echo "APP=$APP"
-          mkdir -p Payload
-          cp -R "$APP" Payload/
-          zip -qry "$TARGET_NAME-unsigned.ipa" Payload
-          ls -lh "$TARGET_NAME-unsigned.ipa"
-
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: NarutoSenki-ipa
-          path: NarutoSenki-unsigned.ipa
-          retention-days: 30
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: naruto-build-logs
+          name: naruto-logs
           path: |
             build-app.log
-            src/out/projects/NarutoSenki/proj.ios/NarutoSenki.xcodeproj/project.pbxproj
+            cocos2dx.log
           retention-days: 7
