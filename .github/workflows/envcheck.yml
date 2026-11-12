@@ -1,0 +1,26 @@
+name: xcodebuild 环境检查
+
+on:
+  workflow_dispatch:
+
+jobs:
+  t:
+    runs-on: macos-15
+    steps:
+      - name: which
+        run: |
+          echo "PATH=$PATH"
+          which xcodebuild || echo "NOT FOUND"
+          ls -la "$(xcode-select -p)" || echo "no xcode-select"
+          xcode-select -p
+          xcodebuild -version; echo "rc=$?"
+          xcrun --sdk iphoneos --show-sdk-path; echo "rc=$?"
+
+      - name: run a hello project
+        run: |
+          cd /tmp
+          mkdir -p h && cd h
+          echo "int main(){return 0;}" > main.m
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=12.0 -c main.m -o main.o
+          echo "clang rc=$?"
+          file main.o
