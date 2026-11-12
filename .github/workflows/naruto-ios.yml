@@ -11,7 +11,7 @@ on:
         options: [ Release, Debug ]
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   TARGET_NAME: NarutoSenki
@@ -34,41 +34,33 @@ jobs:
           path: src
           fetch-depth: 1
 
-      - name: Install python deps (best effort)
+      - name: Install python deps
         continue-on-error: true
         run: |
           python3 -m pip install --quiet --user openstep-parser 2>&1 | tail -3 || true
-          python3 -c "import openstep_parser; print('openstep_parser OK')" || echo "不可用，将跳过语法校验"
+          python3 -c "import openstep_parser; print('openstep_parser OK')" || echo "不可用，跳过深度校验"
 
       - name: Inject CI scripts
         run: |
           mkdir -p src/ci
           cp ci-repo/ci/*.py src/ci/
 
-      - name: Generate proj.ios
-        working-directory: src
-        run: python3 ci/gen_ios_proj.py . out
-
-      - name: Repair pbxproj syntax
-        working-directory: src
-        run: python3 ci/repair_pbxproj.py .
-
-      - name: Fixup pbxproj
-        working-directory: src
-        run: python3 ci/fix_proj.py .
-
-      - name: Patch iOS specifics
-        working-directory: src
-        run: python3 ci/patch_ios.py .
-
-      - name: Validate pbxproj
-        working-directory: src
-        run: python3 ci/selftest.py
-
-      - name: Build cocos2dx static lib
-        id: cocos2dx
+      - name: Generate & patch project
         working-directory: src
         run: |
+          set -e
+          python3 ci/gen_ios_proj.py . out
+          python3 ci/repair_pbxproj.py .
+          python3 ci/fix_proj.py .
+          python3 ci/patch_ios.py .
+          python3 ci/selftest.py
+
+      - name: Build cocos2dx static lib
+        working-directory: src
+        run: |
+          set -o pipefail
+          LIB_OUT="$PWD/out/projects/NarutoSenki/proj.ios/libs"
+          mkdir -p "$LIB_OUT"
           xcodebuild \
             -project cocos2dx/proj.ios/cocos2dx.xcodeproj \
             -target cocos2dx \
@@ -79,18 +71,22 @@ jobs:
             ENABLE_BITCODE=NO \
             CODE_SIGNING_ALLOWED=NO \
             SYMROOT="$PWD/out/libs" \
-            > "$GITHUB_WORKSPACE/cocos2dx.log" 2>&1
-          echo "cocos2dx 退出码: $?"
-          find "$PWD/out/libs" -name "*.a" 2>/dev/null | head
+            > "$GITHUB_WORKSPACE/cocos2dx.log" 2>&1 || {
+              echo "===== cocos2dx 构建失败 ====="
+              tail -80 "$GITHUB_WORKSPACE/cocos2dx.log"
+              exit 1
+            }
+          echo "----- 产物 -----"
+          find "$PWD/out/libs" -name "*.a" -exec ls -lh {} \;
+          # 把静态库放到工程能找到的 libs/ 目录
+          find "$PWD/out/libs" -name "*.a" -exec cp -f {} "$LIB_OUT"/ \;
+          ls -lh "$LIB_OUT"
 
       - name: Build game app
-        id: game
         working-directory: src
         run: |
+          set -o pipefail
           PROJ_DIR="$PWD/out/projects/NarutoSenki/proj.ios"
-          LIB_DIR="$PWD/out/libs/$CONFIG-iphoneos"
-          ls -la "$LIB_DIR" 2>/dev/null || echo "(空)"
-
           cd "$PROJ_DIR"
           xcodebuild \
             -project "$TARGET_NAME.xcodeproj" \
@@ -103,40 +99,89 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
             SYMROOT="$PROJ_DIR/build" \
-            CONFIGURATION_BUILD_DIR="$PROJ_DIR/build/$CONFIG-iphoneos" \
-            > "$GITHUB_WORKSPACE/build-app.log" 2>&1
-          RC=$?
-          echo "游戏退出码: $RC"
-          echo "===== 错误 ====="
-          grep -E "error:|fatal error|ld: |Undefined symbols|BUILD FAILED" \
-            "$GITHUB_WORKSPACE/build-app.log" | sort -u | head -50 || true
-          echo "===== 末尾 40 行 ====="
-          tail -40 "$GITHUB_WORKSPACE/build-app.log"
+            > "$GITHUB_WORKSPACE/build-app.log" 2>&1 || {
+              echo "===== 游戏构建失败 ====="
+              grep -E "error:|fatal error|Undefined symbols|ld: |BUILD FAILED|clang: error" \
+                "$GITHUB_WORKSPACE/build-app.log" | sort -u | head -60 || true
+              echo "----- 末尾 60 行 -----"
+              tail -60 "$GITHUB_WORKSPACE/build-app.log"
+              exit 1
+            }
           find "$PROJ_DIR/build" -name "*.app" -type d
-          exit $RC
 
       - name: Package unsigned IPA
         id: pack
         run: |
-          PROJ_DIR="src/out/projects/NarutoSenki/proj.ios"
-          APP=$(find "$PROJ_DIR/build" -name "*.app" -type d -maxdepth 4 | head -1)
+          set -e
+          APP=$(find src/out/projects/NarutoSenki/proj.ios/build -name "*.app" -type d | head -1)
           if [ -z "$APP" ]; then echo "找不到 .app"; exit 1; fi
           echo "APP=$APP"
-          rm -rf Payload "$TARGET_NAME-unsigned.ipa"
+          rm -rf Payload "$TARGET_NAME.ipa"
           mkdir -p Payload
-          cp -R "$APP" Payload/
-          zip -qry "$TARGET_NAME-unsigned.ipa" Payload
-          ls -lh "$TARGET_NAME-unsigned.ipa"
-          BIN=$(find Payload -maxdepth 2 -type f -perm -u+x | head -1)
-          file "$BIN" || true
-          lipo -info "$BIN" 2>/dev/null || true
+          cp -R "$APP" "Payload/$TARGET_NAME.app"
+          zip -qry "$TARGET_NAME.ipa" Payload
+          ls -lh "$TARGET_NAME.ipa"
+          BIN="Payload/$TARGET_NAME.app/$TARGET_NAME"
+          file "$BIN"
+          lipo -info "$BIN" || true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" \
+            "Payload/$TARGET_NAME.app/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" \
+            "Payload/$TARGET_NAME.app/Info.plist" || true
+          echo "sha256=$(shasum -a 256 "$TARGET_NAME.ipa" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: NarutoSenki ${{ env.CONFIG }} build ${{ github.run_number }}
+          files: NarutoSenki.ipa
+          body: |
+            未签名 IPA，适用于 TrollStore / 自签工具。
+            - 配置：${{ env.CONFIG }}
+            - 架构：arm64
+            - SHA256：`${{ steps.pack.outputs.sha256 }}`
 
       - name: Upload IPA
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: NarutoSenki-ipa
-          path: NarutoSenki-unsigned.ipa
+          path: NarutoSenki.ipa
           retention-days: 30
+
+      - name: Diagnose on failure
+        if: failure()
+        run: |
+          {
+            echo "# 构建失败诊断 (run ${{ github.run_number }})"
+            echo ""
+            echo "## 游戏 target"
+            echo '```'
+            if [ -f build-app.log ]; then
+              grep -E "error:|fatal error|Undefined symbols|ld: |clang: error" build-app.log \
+                | sort -u | head -80 || tail -60 build-app.log
+            else
+              echo "(无日志)"
+            fi
+            echo '```'
+            echo ""
+            echo "## cocos2dx"
+            echo '```'
+            if [ -f cocos2dx.log ]; then
+              grep -E "error:|BUILD FAILED" cocos2dx.log | sort -u | head -40 || tail -40 cocos2dx.log
+            else
+              echo "(无日志)"
+            fi
+            echo '```'
+          } > ci-repo/BUILD_LOG.md
+          cd ci-repo
+          git config user.name bot
+          git config user.email b@x
+          git add BUILD_LOG.md
+          git commit -m "ci: build failure log [skip ci]" || true
+          git push || true
 
       - name: Upload logs
         if: always()
