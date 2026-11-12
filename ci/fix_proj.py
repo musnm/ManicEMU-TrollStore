@@ -29,7 +29,30 @@ if 'BuildIndependentTargetsInParallel' not in s:
                   '\t\t\t\tBuildIndependentTargetsInParallel = YES;')
 print("[+] objectVersion=56 compatibilityVersion=Xcode 14.0")
 
-# 1) LIBRARY_SEARCH_PATHS 补产物目录（cocos2dx 静态库的来源）
+# 1) HEADER_SEARCH_PATHS 补 Classes 根目录
+#    源码用相对 Classes 的包含写法（"MyUtils/KTools.h"、"MyUtils/sqlite3.h"），
+#    不加这条会报 'MyUtils/CMD5Checksum.h' file not found。
+HDR_EXTRA = ['"$(SRCROOT)/../Classes"', '"$(SRCROOT)/../"']
+
+
+def add_header_paths(text):
+    if '$(SRCROOT)/../Classes' in text:
+        return text
+
+    def rep(m):
+        indent = m.group(1)
+        body = "".join(f'{indent}\t{p},\n' for p in HDR_EXTRA)
+        return m.group(0) + body
+
+    return re.sub(r'([\t ]+)HEADER_SEARCH_PATHS = \(\n', rep, text)
+
+
+s1 = add_header_paths(s)
+print("[+] HEADER_SEARCH_PATHS += ../Classes" if s1 != s
+      else "[--] HEADER_SEARCH_PATHS")
+s = s1
+
+# 2) LIBRARY_SEARCH_PATHS 补产物目录（cocos2dx 静态库的来源）
 LIB_PATHS = [
     '"$(inherited)"',
     '"$(SRCROOT)/../../../cocos2dx/platform/third_party/ios/libraries"',
@@ -55,7 +78,7 @@ s2 = fix_lib_paths(s)
 print("[OK] LIBRARY_SEARCH_PATHS" if s2 != s else "[--] LIBRARY_SEARCH_PATHS")
 s = s2
 
-# 2) OTHER_LDFLAGS
+# 3) OTHER_LDFLAGS
 #    HelloCpp 模板完全没有链接参数，app target 不会链接 libcocos2dx.a 和系统
 #    框架，必然报 Undefined symbols（_cocos2d::*、_gl* 等）。
 #    注意：不用 -all_load（与 -lcurl/-lwebp 组合会产生重复符号，
@@ -95,7 +118,7 @@ s3 = add_other_ldflags(s)
 print("[+] OTHER_LDFLAGS" if s3 != s else "[--] OTHER_LDFLAGS")
 s = s3
 
-# 3) 架构
+# 4) 架构
 n = len(re.findall(r'\n\t+VALID_ARCHS = [^;]+;', s))
 s = re.sub(r'\n\t+VALID_ARCHS = [^;]+;', '', s)
 print("[+] 移除 VALID_ARCHS x%d" % n)
@@ -106,7 +129,7 @@ for v in ['"$(ARCHS_STANDARD_32_BIT)"', '"$(ARCHS_STANDARD)"',
           '"arm64 armv7 i386"']:
     s = s.replace('ARCHS = ' + v + ';', 'ARCHS = arm64;')
 
-# 4) 签名与 bitcode
+# 5) 签名与 bitcode
 s = re.sub(r'CODE_SIGN_IDENTITY = "[^"]*";', 'CODE_SIGN_IDENTITY = "";', s)
 s = re.sub(r'"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "[^"]*";',
            '"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "";', s)
