@@ -1,5 +1,19 @@
 #!/bin/sh
-# 打包成 TrollStore 可直装的未签名（ad-hoc 签名）IPA。
+# 打包成 TrollStore 可直装的 IPA。
+#
+# 重要：这里绝对不能在 CI 里做 codesign。
+#
+# 实测（TrollStore 的 trollstorehelper 日志）：
+#   macOS runner 上 `codesign -s -` 给这个老式 Mach-O 写出来的签名结构是
+#   畸形的 —— SuperBlob 只有 1 个条目、且把 CodeDirectory 塞进了 slot 0
+#   （magic 应为 0xfade0c01，实际是 0xfade0c02）。LaunchServices 解析时
+#   从错误偏移读到 SignatureVersion = 132352，注册阶段直接失败：
+#       Error: Unable to register .../NarutoSenki.app
+#       trollstorehelper returning 181
+#
+# 正确做法：只让链接器预留一个空的 LC_CODE_SIGNATURE 槽位
+# （-Wl,-adhoc_codesign 已在链接阶段完成），签名全部交给 TrollStore 的
+# ldid 在设备上完成。
 set -e
 
 TARGET_NAME="${TARGET_NAME:-NarutoSenki}"
@@ -26,36 +40,13 @@ echo "----- 可执行文件 -----"
 file "$BIN"
 lipo -info "$BIN" || true
 
-# 清掉可能来自构建机的扩展属性
+# 清掉构建机带来的扩展属性（否则会被打进 zip 的元数据里）
 xattr -cr "$APP_DIR" 2>/dev/null || true
 
-echo "----- ad-hoc 签名 -----"
-ENT="/tmp/ent.plist"
-cat > "$ENT" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>application-identifier</key>
-	<string>TROLLTROLL.*</string>
-	<key>com.apple.developer.team-identifier</key>
-	<string>TROLLTROLL</string>
-	<key>get-task-allow</key>
-	<true/>
-	<key>keychain-access-groups</key>
-	<array>
-		<string>TROLLTROLL.*</string>
-	</array>
-</dict>
-</plist>
-EOF
-
-codesign --force --sign - --timestamp=none --entitlements "$ENT" "$APP_DIR" 2>&1 | tail -3 || \
-    codesign --force --sign - --timestamp=none "$APP_DIR" 2>&1 | tail -3
-
-echo "----- 签名验证 -----"
-codesign -dv "$BIN" 2>&1 | head -8 || true
-codesign --verify --verbose=2 "$APP_DIR" 2>&1 | tail -3 || true
+echo "----- 清除任何残留签名（关键） -----"
+# ld 的 -adhoc_codesign 已给出 LC_CODE_SIGNATURE 槽位。这里若有 codesign
+# 产物会被 TrollStore 误读，先去掉再重新留空槽。
+codesign --remove-signature "$BIN" 2>/dev/null && echo "  已移除旧签名" || echo "  无旧签名"
 
 echo "----- 打包前校验 -----"
 python3 ci/check_bundle.py "$APP_DIR"
