@@ -34,6 +34,9 @@ jobs:
           path: src
           fetch-depth: 1
 
+      - name: Setup python deps
+        run: pip3 install --quiet openstep-parser
+
       - name: Inject CI scripts
         run: |
           mkdir -p src/ci
@@ -42,6 +45,10 @@ jobs:
       - name: Generate proj.ios
         working-directory: src
         run: python3 ci/gen_ios_proj.py . out
+
+      - name: Repair pbxproj syntax
+        working-directory: src
+        run: python3 ci/repair_pbxproj.py .
 
       - name: Fixup pbxproj
         working-directory: src
@@ -56,6 +63,7 @@ jobs:
         run: python3 ci/selftest.py
 
       - name: Build cocos2dx static lib
+        id: cocos2dx
         working-directory: src
         run: |
           xcodebuild \
@@ -72,52 +80,61 @@ jobs:
           echo "cocos2dx 退出码: $?"
           find "$PWD/out/libs" -name "*.a" 2>/dev/null | head
 
-      - name: Probe game project
+      - name: Build game app
+        id: game
         working-directory: src
         run: |
           PROJ_DIR="$PWD/out/projects/NarutoSenki/proj.ios"
+          LIB_DIR="$PWD/out/libs/$CONFIG-iphoneos"
+          echo "LIB_DIR=$LIB_DIR"
+          ls -la "$LIB_DIR" 2>/dev/null || echo "(空)"
+
           cd "$PROJ_DIR"
-          LOG="$GITHUB_WORKSPACE/probe.log"
-
-          xcodebuild -project "$TARGET_NAME.xcodeproj" -list > "$LOG" 2>&1
-          echo "### -list 退出码: $?"
-          head -30 "$LOG"
-
-          echo "### 工程文件是否存在"
-          ls -la "$TARGET_NAME.xcodeproj/"
-
-          echo "### 最小参数编译"
-          xcodebuild -project "$TARGET_NAME.xcodeproj" \
-                     -target "$TARGET_NAME" \
-                     -sdk iphoneos \
-                     -configuration "$CONFIG" \
-                     -arch arm64 \
-                     CODE_SIGNING_ALLOWED=NO \
-                     CODE_SIGN_IDENTITY="" \
-                     ONLY_ACTIVE_ARCH=NO \
-                     ENABLE_BITCODE=NO \
-                     > "$LOG" 2>&1
+          xcodebuild \
+            -project "$TARGET_NAME.xcodeproj" \
+            -target "$TARGET_NAME" \
+            -sdk iphoneos \
+            -configuration "$CONFIG" \
+            -arch arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            ENABLE_BITCODE=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            SYMROOT="$PROJ_DIR/build" \
+            CONFIGURATION_BUILD_DIR="$PROJ_DIR/build/$CONFIG-iphoneos" \
+            > "$GITHUB_WORKSPACE/build-app.log" 2>&1
           RC=$?
-          echo "### 编译退出码: $RC"
-          echo "########## 前 60 行 ##########"
-          head -60 "$LOG"
-          echo "########## 后 60 行 ##########"
-          tail -60 "$LOG"
-          echo "PROBE_RC=$RC" >> "$GITHUB_ENV"
+          echo "游戏退出码: $RC"
+          echo "===== 错误 ====="
+          grep -E "error:|fatal error|ld: |Undefined symbols|BUILD FAILED" \
+            "$GITHUB_WORKSPACE/build-app.log" | sort -u | head -50 || true
+          echo "===== 末尾 40 行 ====="
+          tail -40 "$GITHUB_WORKSPACE/build-app.log"
+          find "$PROJ_DIR/build" -name "*.app" -type d
+          exit $RC
 
-      - name: Summary
-        if: always()
+      - name: Package unsigned IPA
+        id: pack
         run: |
-          {
-            echo "## NarutoSenki iOS"
-            echo ""
-            echo "PROBE_RC = ${{ env.PROBE_RC }}"
-            echo ""
-            echo '### probe.log（全部）'
-            echo '```'
-            cat probe.log 2>/dev/null | head -200 || echo "(无)"
-            echo '```'
-          } >> $GITHUB_STEP_SUMMARY
+          PROJ_DIR="src/out/projects/NarutoSenki/proj.ios"
+          APP=$(find "$PROJ_DIR/build" -name "*.app" -type d -maxdepth 4 | head -1)
+          if [ -z "$APP" ]; then echo "找不到 .app"; exit 1; fi
+          echo "APP=$APP"
+          rm -rf Payload "$TARGET_NAME-unsigned.ipa"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry "$TARGET_NAME-unsigned.ipa" Payload
+          ls -lh "$TARGET_NAME-unsigned.ipa"
+          BIN=$(find Payload -maxdepth 2 -type f -perm -u+x | head -1)
+          file "$BIN" || true
+          lipo -info "$BIN" 2>/dev/null || true
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NarutoSenki-ipa
+          path: NarutoSenki-unsigned.ipa
+          retention-days: 30
 
       - name: Upload logs
         if: always()
@@ -125,6 +142,6 @@ jobs:
         with:
           name: naruto-logs
           path: |
-            probe.log
+            build-app.log
             cocos2dx.log
           retention-days: 7
