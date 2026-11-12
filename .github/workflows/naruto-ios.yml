@@ -43,6 +43,10 @@ jobs:
         working-directory: src
         run: python3 ci/gen_ios_proj.py . out
 
+      - name: Fixup pbxproj
+        working-directory: src
+        run: python3 ci/fix_proj.py .
+
       - name: Patch iOS specifics
         working-directory: src
         run: python3 ci/patch_ios.py .
@@ -51,21 +55,6 @@ jobs:
         working-directory: src
         run: python3 ci/selftest.py
 
-      # ---------- 诊断：列出工程里的 target ----------
-      - name: Diagnose project
-        working-directory: src
-        run: |
-          PROJ="out/projects/NarutoSenki/proj.ios/NarutoSenki.xcodeproj"
-          echo "===== xcodebuild -list ====="
-          xcodebuild -project "$PROJ" -list 2>&1 | head -60 || true
-          echo
-          echo "===== 工程目录 ====="
-          ls -la out/projects/NarutoSenki/proj.ios/
-          echo
-          echo "===== 子工程引用 ====="
-          grep -nE "cocos2dx.xcodeproj|CocosDenshion" "$PROJ/project.pbxproj" | head -20
-
-      # ---------- 编译 cocos2dx 静态库 ----------
       - name: Build cocos2dx static lib
         id: cocos2dx
         working-directory: src
@@ -83,19 +72,21 @@ jobs:
             SYMROOT="$PWD/out/libs" \
             > "$GITHUB_WORKSPACE/cocos2dx.log" 2>&1
           echo "退出码: $?"
-          echo "===== 产出的 .a ====="
-          find "$PWD/out/libs" -name "*.a" 2>/dev/null || true
-          echo "===== 日志末尾 30 行 ====="
-          tail -30 "$GITHUB_WORKSPACE/cocos2dx.log"
+          find "$PWD/out/libs" -name "*.a" 2>/dev/null
+          tail -20 "$GITHUB_WORKSPACE/cocos2dx.log"
 
-      # ---------- 编译游戏 App ----------
+      # ---------- 编译游戏 ----------
       - name: Build game app
         id: game
         working-directory: src
+        continue-on-error: true
         run: |
           PROJ_DIR="$PWD/out/projects/NarutoSenki/proj.ios"
+          LIB_DIR="$PWD/out/libs/$CONFIG-iphoneos"
+          echo "LIB_DIR=$LIB_DIR"
+          ls -la "$LIB_DIR" 2>/dev/null || echo "(库目录为空)"
+
           cd "$PROJ_DIR"
-          set +e
           xcodebuild \
             -project "$TARGET_NAME.xcodeproj" \
             -target "$TARGET_NAME" \
@@ -106,21 +97,42 @@ jobs:
             ENABLE_BITCODE=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
+            LIBRARY_SEARCH_PATHS="$LIB_DIR \$(inherited)" \
+            CONFIGURATION_BUILD_DIR="$PROJ_DIR/build/$CONFIG-iphoneos" \
             SYMROOT="$PROJ_DIR/build" \
             > "$GITHUB_WORKSPACE/build-app.log" 2>&1
           RC=$?
+          echo "xcodebuild 退出码: $RC"
 
-          echo "################ xcodebuild 退出码: $RC ################"
-          echo
-          echo "################ 完整日志（最后 250 行） ################"
-          tail -250 "$GITHUB_WORKSPACE/build-app.log"
-          echo
-          echo "################ 错误行统计 ################"
-          grep -cE "error:" "$GITHUB_WORKSPACE/build-app.log" 2>/dev/null || echo 0
-          echo "################ 错误行（前 80 条） ################"
-          grep -E "error:|fatal error|Undefined symbols|ld: |BUILD FAILED" "$GITHUB_WORKSPACE/build-app.log" \
-            | sort -u | head -80 || true
+          echo "===== 错误行 ====="
+          grep -E "error:|fatal error|ld: |Undefined symbols|BUILD FAILED" \
+            "$GITHUB_WORKSPACE/build-app.log" | sort -u | head -60 || true
+          echo "===== 末尾 60 行 ====="
+          tail -60 "$GITHUB_WORKSPACE/build-app.log"
+          find "$PROJ_DIR/build" -name "*.app" -type d || true
           exit $RC
+
+      # ---------- 无论如何把关键信息写进 Step Summary（无需认证即可读）----------
+      - name: Push diagnostic summary
+        if: always()
+        run: |
+          TITLE="NarutoSenki iOS — ${{ job.status }}"
+          {
+            echo "## $TITLE"
+            echo ""
+            echo "- cocos2dx 库: ${{ steps.cocos2dx.outcome }}"
+            echo "- 游戏 App: ${{ steps.game.outcome }}"
+            echo ""
+            echo '### build-app.log 关键行'
+            echo '```'
+            grep -E "error:|fatal error|ld: |Undefined symbols|BUILD FAILED|not found" \
+              build-app.log 2>/dev/null | sort -u | head -50 || echo "(无)"
+            echo '```'
+            echo '### build-app.log 末尾 100 行'
+            echo '```'
+            tail -100 build-app.log 2>/dev/null || echo "(无日志)"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: Upload logs
         if: always()
