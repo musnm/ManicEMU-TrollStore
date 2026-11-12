@@ -90,6 +90,22 @@ def mirror_tree():
             _link_tree(s, os.path.join(outs, name), f"projects/NarutoSenki/{name}")
 
 
+def insert_into_files_list(body, new_items):
+    """把 new_items 插入到 `files = ( ... );` 列表内部，保持 OpenStep 结构合法。
+
+    旧实现把新条目追加到 build phase 尾部（runOnlyForDeploymentPostprocessing
+    之后），生成的项目文件结构损坏，xcodebuild 报：
+    "The project ... is damaged and cannot be opened due to a parse error."
+    """
+    mf = re.search(r'(files = \()(.*?)(\s*\);)', body, re.S)
+    assert mf, "找不到 files 列表"
+    items = mf.group(2).rstrip()
+    if items and not items.endswith(","):
+        items += ","
+    items += new_items
+    return body[:mf.start(2)] + items + body[mf.end(2):]
+
+
 def main():
     for d in (TPL_PROJ, GAME_CLASSES):
         assert os.path.isdir(d), f"目录不存在: {d}"
@@ -197,18 +213,15 @@ def main():
     body = m.group(2)
     for did in dead_sample:
         body = re.sub(rf'\t+{did} /\* [^*]+ \*/,\n', '', body)
-    body = body.rstrip()
-    if not body.rstrip().endswith(","):
-        body += ","
-    body += f'\n\t\t\t\t{res_build_id} /* Resources in Resources */,\n\t\t\t'
+    body = insert_into_files_list(
+        body, f'\n\t\t\t\t{res_build_id} /* Resources in Resources */,\n\t\t\t')
     s = s[:m.start(2)] + body + s[m.end(2):]
 
     m = re.search(r'([0-9A-F]{24}) /\* Sources \*/ = \{\s*isa = PBXSourcesBuildPhase;(.*?)\};', s, re.S)
     assert m, "找不到 Sources build phase"
-    body = m.group(2).rstrip()
-    if not body.endswith(","):
-        body += ","
-    body += "\n" + "\n".join(build_children) + "\n\t\t\t"
+    body = m.group(2)
+    body = insert_into_files_list(
+        body, "\n" + "\n".join(build_children) + "\n\t\t\t")
     s = s[:m.start(2)] + body + s[m.end(2):]
 
     s = s.replace('/* End PBXFileReference section */',
