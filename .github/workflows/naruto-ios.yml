@@ -44,6 +44,8 @@ jobs:
         run: |
           mkdir -p src/ci
           cp ci-repo/ci/*.py src/ci/
+          cp ci-repo/ci/mk_ipa.sh src/ci/
+          chmod +x src/ci/mk_ipa.sh
 
       - name: Generate & patch project
         working-directory: src
@@ -76,7 +78,6 @@ jobs:
               tail -80 "$GITHUB_WORKSPACE/cocos2dx.log"
               exit 1
             }
-          find "$PWD/out/libs" -name "*.a" -exec ls -lh {} \;
           find "$PWD/out/libs" -name "*.a" -exec cp -f {} "$LIB_OUT"/ \;
           ls -lh "$LIB_OUT"
 
@@ -113,55 +114,13 @@ jobs:
 
       - name: Package & ad-hoc sign IPA
         id: pack
+        working-directory: src
         run: |
           set -e
-          APP=$(find src/out/projects/NarutoSenki/proj.ios/build -name "*.app" -type d | head -1)
+          APP=$(find out/projects/NarutoSenki/proj.ios/build -name "*.app" -type d | head -1)
           if [ -z "$APP" ]; then echo "找不到 .app"; exit 1; fi
           echo "APP=$APP"
-          rm -rf Payload "$TARGET_NAME.ipa"
-          mkdir -p "Payload/$TARGET_NAME.app"
-          cp -R "$APP"/. "Payload/$TARGET_NAME.app"/
-
-          BIN="Payload/$TARGET_NAME.app/$TARGET_NAME"
-
-          echo "----- 签名前 LC_CODE_SIGNATURE 检查 -----"
-          python3 - "$BIN" <<'PY'
-          import struct, sys
-          p = sys.argv[1]
-          d = open(p, 'rb').read()
-          ncmds = struct.unpack('<I', d[16:20])[0]
-          off, found = 32, False
-          for _ in range(ncmds):
-              cmd, sz = struct.unpack('<II', d[off:off+8])
-              if cmd == 0x1d:
-                  found = True
-              off += sz
-          print("LC_CODE_SIGNATURE:", found)
-          if not found:
-              print("!! 缺少代码签名段，TrollStore 将无法注册")
-              sys.exit(1)
-          PY
-
-          echo "----- ad-hoc 签名 -----"
-          codesign --force --sign - --timestamp=none \
-            --entitlements /dev/null "$BIN" 2>/dev/null || \
-            codesign --force --sign - --timestamp=none "$BIN"
-          codesign -dv "$BIN" 2>&1 | head -10 || true
-          codesign --verify --deep --verbose=2 "Payload/$TARGET_NAME.app" 2>&1 | tail -5 || true
-
-          # 清理可能干扰的扩展属性
-          xattr -cr "Payload/$TARGET_NAME.app" || true
-
-          zip -qry "$TARGET_NAME.ipa" Payload
-          ls -lh "$TARGET_NAME.ipa"
-          file "$BIN"
-          lipo -info "$BIN" || true
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" \
-            "Payload/$TARGET_NAME.app/Info.plist" || true
-          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" \
-            "Payload/$TARGET_NAME.app/Info.plist" || true
-          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" \
-            "Payload/$TARGET_NAME.app/Info.plist" || true
+          sh ci/mk_ipa.sh "$APP" 2>&1 | tee "$GITHUB_WORKSPACE/pack.log"
           echo "sha256=$(shasum -a 256 "$TARGET_NAME.ipa" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
@@ -170,9 +129,9 @@ jobs:
         with:
           tag_name: build-${{ github.run_number }}
           name: NarutoSenki ${{ env.CONFIG }} build ${{ github.run_number }}
-          files: NarutoSenki.ipa
+          files: src/NarutoSenki.ipa
           body: |
-            TrollStore 可直装 IPA（已做 ad-hoc 签名，含 LC_CODE_SIGNATURE）。
+            TrollStore 可直装 IPA（ad-hoc 签名，含 LC_CODE_SIGNATURE）。
 
             - 配置：${{ env.CONFIG }}
             - 架构：arm64
@@ -186,7 +145,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: NarutoSenki-ipa
-          path: NarutoSenki.ipa
+          path: src/NarutoSenki.ipa
           retention-days: 30
 
       - name: Diagnose on failure
@@ -195,11 +154,17 @@ jobs:
           {
             echo "# 构建失败诊断 (run ${{ github.run_number }})"
             echo ""
+            echo "## 打包"
+            echo '```'
+            [ -f pack.log ] && tail -60 pack.log || echo "(无)"
+            echo '```'
+            echo ""
             echo "## 游戏 target"
             echo '```'
             if [ -f build-app.log ]; then
-              grep -E "error:|fatal error|Undefined symbols|ld: |clang: error" build-app.log \
-                | sort -u | head -80 || tail -60 build-app.log
+              grep -vE "^ld: warning:" build-app.log \
+                | grep -E "error:|fatal error|Undefined symbols|clang: error" \
+                | sort -u | head -60 || tail -60 build-app.log
             else
               echo "(无日志)"
             fi
@@ -229,4 +194,5 @@ jobs:
           path: |
             build-app.log
             cocos2dx.log
+            pack.log
           retention-days: 7
