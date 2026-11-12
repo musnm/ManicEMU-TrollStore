@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   probe:
@@ -34,33 +34,41 @@ jobs:
           python3 ci/selftest.py .
 
       - name: PROBE
-        working-directory: src
+        working-directory: src/out/projects/NarutoSenki/proj.ios
         run: |
-          P="out/projects/NarutoSenki/proj.ios/NarutoSenki.xcodeproj"
-          cd "out/projects/NarutoSenki/proj.ios"
+          R="$GITHUB_WORKSPACE/report.txt"
+          : > "$R"
 
-          echo "############ A: -list ############"
-          xcodebuild -project NarutoSenki.xcodeproj -list; echo "A_RC=$?"
+          run() {
+            name="$1"; shift
+            echo "===== $name =====" >> "$R"
+            echo "CMD: xcodebuild $*" >> "$R"
+            xcodebuild "$@" > /tmp/o.txt 2>&1
+            rc=$?
+            echo "RC=$rc" >> "$R"
+            echo "--- first 25 ---" >> "$R"
+            head -25 /tmp/o.txt >> "$R"
+            echo "--- last 15 ---" >> "$R"
+            tail -15 /tmp/o.txt >> "$R"
+            echo "" >> "$R"
+          }
 
-          echo "############ B: -scheme ############"
-          xcodebuild -project NarutoSenki.xcodeproj -scheme NarutoSenki -showBuildSettings 2>&1 | head -5; echo "B_RC=$?"
+          run "A_list"    -project NarutoSenki.xcodeproj -list
+          run "B_showSettings" -project NarutoSenki.xcodeproj -target NarutoSenki -showBuildSettings
+          run "C_target_sdk" -project NarutoSenki.xcodeproj -target NarutoSenki -sdk iphoneos CODE_SIGNING_ALLOWED=NO
+          run "D_conf"    -project NarutoSenki.xcodeproj -target NarutoSenki -sdk iphoneos -configuration Release CODE_SIGNING_ALLOWED=NO
+          run "E_arch"    -project NarutoSenki.xcodeproj -target NarutoSenki -sdk iphoneos -configuration Release -arch arm64 CODE_SIGNING_ALLOWED=NO
 
-          echo "############ C: -target + -sdk ############"
-          xcodebuild -project NarutoSenki.xcodeproj -target NarutoSenki -sdk iphoneos CODE_SIGNING_ALLOWED=NO 2>&1 | tail -20; echo "C_RC=$?"
-
-          echo "############ D: 加 -configuration ############"
-          xcodebuild -project NarutoSenki.xcodeproj -target NarutoSenki -sdk iphoneos -configuration Release CODE_SIGNING_ALLOWED=NO 2>&1 | tail -10; echo "D_RC=$?"
-
-          echo "############ E: 加 -arch arm64 ############"
-          xcodebuild -project NarutoSenki.xcodeproj -target NarutoSenki -sdk iphoneos -configuration Release -arch arm64 CODE_SIGNING_ALLOWED=NO 2>&1 | tail -10; echo "E_RC=$?"
-
-          echo "############ F: 加 SYMROOT ############"
-          xcodebuild -project NarutoSenki.xcodeproj -target NarutoSenki -sdk iphoneos -configuration Release SYMROOT="$PWD/build" CODE_SIGNING_ALLOWED=NO 2>&1 | tail -10; echo "F_RC=$?"
-
-          echo "############ G: 加 CONFIGURATION_BUILD_DIR ############"
-          xcodebuild -project NarutoSenki.xcodeproj -target NarutoSenki -sdk iphoneos -configuration Release CONFIGURATION_BUILD_DIR="$PWD/build/Release-iphoneos" CODE_SIGNING_ALLOWED=NO 2>&1 | tail -10; echo "G_RC=$?"
+          cp "$R" "$GITHUB_WORKSPACE/ci-repo/report.txt"
+          echo "报告行数: $(wc -l < $R)"
         continue-on-error: true
 
-      - name: Summary
+      - name: Commit report
         if: always()
-        run: echo "done" >> $GITHUB_STEP_SUMMARY
+        run: |
+          cd ci-repo
+          git config user.name "ci-bot"
+          git config user.email "ci@example.com"
+          git add report.txt
+          git commit -m "ci: probe report [skip ci]" || echo "no changes"
+          git push || echo "push failed"
